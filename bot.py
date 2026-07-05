@@ -37,7 +37,7 @@ from telethon.errors import (
     ChannelsTooMuchError,
     ChatAdminRequiredError,
 )
-from anthropic import Anthropic
+import requests
 
 # ---------------------------------------------------------------------------
 # SOZLAMALAR (barchasi Environment Variables orqali olinadi - kodga yozmang!)
@@ -78,7 +78,12 @@ MAX_GROUPS_PER_RUN = 8
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ustalar_bot")
 
-claude = Anthropic(api_key=ANTHROPIC_API_KEY)
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_HEADERS = {
+    "x-api-key": ANTHROPIC_API_KEY,
+    "anthropic-version": "2023-06-01",
+    "content-type": "application/json",
+}
 
 if SESSION_STRING:
     from telethon.sessions import StringSession
@@ -156,22 +161,29 @@ def quick_keyword_check(text: str) -> bool:
 
 
 async def is_construction_job_post(text: str) -> bool:
-    """Claude AI orqali xabar chindan ham ustachilik ishi/e'loni ekanini tekshiradi."""
+    """Claude AI orqali (requests/HTTP orqali) xabar chindan ham ustachilik ishi/e'loni ekanini tekshiradi."""
+    payload = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 10,
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Quyidagi Telegram xabari qurilish/ustachilik xizmati bilan bog'liqmi "
+                "(masalan: gipsokarton, kafel, elektrik, santexnika, bo'yoq, remont, "
+                "montaj kabi ish/e'lon/vakansiya)? Faqat 'HA' yoki 'YOQ' deb javob ber.\n\n"
+                f"Xabar: {text}"
+            )
+        }]
+    }
     try:
-        response = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=10,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Quyidagi Telegram xabari qurilish/ustachilik xizmati bilan bog'liqmi "
-                    "(masalan: gipsokarton, kafel, elektrik, santexnika, bo'yoq, remont, "
-                    "montaj kabi ish/e'lon/vakansiya)? Faqat 'HA' yoki 'YOQ' deb javob ber.\n\n"
-                    f"Xabar: {text}"
-                )
-            }]
+        # requests kutubxonasi sinxron - alohida thread'da ishga tushiramiz
+        # asyncio event loop'ni bloklamaslik uchun
+        response = await asyncio.to_thread(
+            requests.post, ANTHROPIC_API_URL, headers=ANTHROPIC_HEADERS, json=payload, timeout=30
         )
-        answer = response.content[0].text.strip().upper()
+        response.raise_for_status()
+        data = response.json()
+        answer = data["content"][0]["text"].strip().upper()
         return answer.startswith("HA")
     except Exception as e:
         log.error("Claude API xatoligi: %s", e)
