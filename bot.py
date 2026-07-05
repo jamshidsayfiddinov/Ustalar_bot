@@ -200,7 +200,7 @@ def quick_keyword_check(text: str) -> bool:
 async def is_construction_job_post(text: str) -> bool:
     """Claude AI orqali (requests/HTTP orqali) xabar chindan ham ustachilik ishi/e'loni ekanini tekshiradi."""
     payload = {
-        "model": "claude-sonnet-4-6",
+        "model": "claude-sonnet-5",
         "max_tokens": 10,
         "messages": [{
             "role": "user",
@@ -218,7 +218,9 @@ async def is_construction_job_post(text: str) -> bool:
         response = await asyncio.to_thread(
             requests.post, ANTHROPIC_API_URL, headers=ANTHROPIC_HEADERS, json=payload, timeout=30
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            log.error("Claude API xatoligi (%d): %s", response.status_code, response.text[:300])
+            return False
         data = response.json()
         answer = data["content"][0]["text"].strip().upper()
         return answer.startswith("HA")
@@ -402,3 +404,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+   
