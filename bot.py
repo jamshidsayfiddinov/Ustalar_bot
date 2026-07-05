@@ -2,12 +2,14 @@
 USTALRTOSHKENT Bot
 -------------------
 Vazifasi:
-1. Qurilish/ustachilik mavzusidagi ochiq Telegram guruhlarini avtomatik qidirib topadi
-   va ularga sekin-asta (flood-limitga tushmaslik uchun) qo'shiladi.
-2. Botga QO'SHILGANDAN KEYIN kelgan yangi xabarlarnigina tahlil qiladi (eski tarixni o'qimaydi).
-3. Har bir xabarni Claude AI orqali tekshiradi: bu gipsokarton/kafel/elektrik/santexnika/
+1. Qurilish/ustachilik mavzusidagi ochiq Telegram guruh va kanallarini avtomatik
+   qidirib topadi va ularga sekin-asta (flood-limitga tushmaslik uchun) qo'shiladi.
+2. Bot ishga tushganda, allaqachon a'zo bo'lgan barcha guruh/kanallardagi
+   KECHA va BUGUN yozilgan xabarlarni BIR MARTA skanerlab chiqadi.
+3. Shundan keyin YANGI kelayotgan xabarlarni ham real vaqtda kuzatib boradi.
+4. Har bir xabarni Claude AI orqali tekshiradi: bu gipsokarton/kafel/elektrik/santexnika/
    bo'yoq va h.k. ustachilik ishimi yoki yo'qmi.
-4. Agar mos kelsa:
+5. Agar mos kelsa:
    - Xabarda telefon raqami bo'lsa -> xabarni o'zgarishsiz kanalga forward qiladi.
    - Xabarda telefon raqami bo'lmasa -> xabar matni bilan BIRGA, yozgan odamning
      username yoki kontaktini ham qo'shib kanalga tashlaydi.
@@ -26,7 +28,7 @@ import asyncio
 import os
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.contacts import SearchRequest
@@ -75,6 +77,14 @@ PHONE_REGEX = re.compile(r"(\+?998[\s\-]?\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{
 JOIN_DELAY_SECONDS = 45
 MAX_GROUPS_PER_RUN = 8
 
+# Tarixiy skanerlashda nechta kunlik xabarlarni o'qish kerak (0 = faqat bugun, 1 = kecha+bugun)
+HISTORY_SCAN_DAYS_BACK = 1
+# Xavfsizlik uchun har bir chatda tekshiriladigan maksimal xabarlar soni
+# (juda faol guruhda cheksiz aylanib qolmaslik uchun)
+MAX_MESSAGES_SAFETY_CAP = 500
+# Tarixiy xabarlarni tekshirish orasida biroz kutish - flood-limitdan qochish uchun
+HISTORY_SCAN_DELAY_SECONDS = 1
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ustalar_bot")
 
@@ -95,6 +105,33 @@ else:
 BOT_START_TIME = None
 # Qo'shilgan guruhlar ro'yxati (runtime uchun; xohlasangiz storage.py bilan saqlash mumkin)
 JOINED_GROUP_IDS = set()
+
+# Postlangan xabarlarni takrorlamaslik uchun fayl - (chat_id, message_id) juftliklarini saqlaydi
+POSTED_IDS_FILE = "posted_ids.txt"
+POSTED_IDS = set()
+
+
+def load_posted_ids():
+    """Diskdan avval postlangan xabarlar ro'yxatini yuklaydi (qayta ishga tushirilganda takrorlamaslik uchun)."""
+    if os.path.exists(POSTED_IDS_FILE):
+        with open(POSTED_IDS_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    POSTED_IDS.add(line)
+    log.info("Yuklandi: %d ta avval postlangan xabar ID.", len(POSTED_IDS))
+
+
+def mark_as_posted(chat_id: int, message_id: int):
+    """Xabarni postlangan deb belgilaydi va diskka yozadi."""
+    key = f"{chat_id}:{message_id}"
+    POSTED_IDS.add(key)
+    with open(POSTED_IDS_FILE, "a") as f:
+        f.write(key + "\n")
+
+
+def already_posted(chat_id: int, message_id: int) -> bool:
+    return f"{chat_id}:{message_id}" in POSTED_IDS
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +232,35 @@ def extract_phone(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+async def process_message_text(text: str, get_sender_coro, chat_id: int, message_id: int) -> bool:
+    """
+    Umumiy tahlil mantiqi - ham tarixiy, ham yangi xabarlar uchun ishlatiladi.
+    get_sender_coro - yuboruvchini olish uchun chaqiriladigan async funksiya (kerak bo'lgandagina).
+    Xabar joylangan bo'lsa True qaytaradi.
+    """
+    if already_posted(chat_id, message_id):
+        return False
+
+    if not quick_keyword_check(text):
+        return False
+
+    if not await is_construction_job_post(text):
+        return False
+
+    phone = extract_phone(text)
+    sender = await get_sender_coro()
+    sender_username = getattr(sender, "username", None) if sender else None
+
+    await post_to_channel(
+        message_text=text,
+        sender_username=sender_username,
+        sender_phone_contact=None,
+        has_phone=bool(phone),
+    )
+    mark_as_posted(chat_id, message_id)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # 3-QISM: KANALGA JOYLASH
 # ---------------------------------------------------------------------------
@@ -223,38 +289,94 @@ async def post_to_channel(message_text: str, sender_username: str | None, sender
 
 
 # ---------------------------------------------------------------------------
-# 4-QISM: YANGI XABARLARNI TINGLASH (faqat ulanishdan keyingilar)
+# 4-QISM: MAVJUD GURUH/KANALLARDAGI O'QILMAGAN XABARLARNI BIR MARTALIK SKANERLASH
+# ---------------------------------------------------------------------------
+
+async def scan_recent_messages():
+    """
+    Bot ishga tushganda, a'zo bo'lgan barcha guruh va kanallardagi KECHA va BUGUN
+    yozilgan xabarlarni (o'qilgan/o'qilmaganidan qat'iy nazar) bir marta tekshirib chiqadi.
+    """
+    log.info("Kecha va bugungi xabarlarni skanerlash boshlandi...")
+    total_checked = 0
+    total_posted = 0
+
+    # Telefon/serverning mahalliy vaqt zonasi bo'yicha "bugun"ni aniqlaymiz
+    now_local = datetime.now().astimezone()
+    cutoff_date = (now_local - timedelta(days=HISTORY_SCAN_DAYS_BACK)).date()
+
+    async for dialog in client.iter_dialogs():
+        # Faqat guruh va kanallarni tekshiramiz (shaxsiy chatlarni emas)
+        if not (dialog.is_group or dialog.is_channel):
+            continue
+
+        scanned_in_chat = 0
+        try:
+            async for message in client.iter_messages(dialog.entity, limit=MAX_MESSAGES_SAFETY_CAP):
+                # Xabarlar odatda yangidan eskiga qarab keladi - sana chegarasidan
+                # o'tib ketsak, shu chat uchun to'xtatamiz
+                message_local_date = message.date.astimezone().date()
+                if message_local_date < cutoff_date:
+                    break
+
+                scanned_in_chat += 1
+                if not message.message:
+                    continue
+
+                total_checked += 1
+
+                async def get_sender(msg=message):
+                    try:
+                        return await msg.get_sender()
+                    except Exception:
+                        return None
+
+                posted = await process_message_text(
+                    message.message, get_sender, dialog.entity.id, message.id
+                )
+                if posted:
+                    total_posted += 1
+
+                await asyncio.sleep(HISTORY_SCAN_DELAY_SECONDS)
+
+            if scanned_in_chat >= MAX_MESSAGES_SAFETY_CAP:
+                log.warning(
+                    "'%s' juda faol - xavfsizlik chegarasi (%d) ga yetdi, "
+                    "ba'zi eski xabarlar tekshirilmagan bo'lishi mumkin.",
+                    dialog.name, MAX_MESSAGES_SAFETY_CAP,
+                )
+
+        except FloodWaitError as e:
+            log.warning("Tarixiy skanerlashda flood-wait: %s soniya kutamiz", e.seconds)
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            log.error("'%s' dagi tarixni skanerlashda xatolik: %s", dialog.name, e)
+
+    log.info(
+        "Kecha/bugungi xabarlarni skanerlash tugadi. Tekshirildi: %d, kanalga joylandi: %d",
+        total_checked, total_posted,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5-QISM: YANGI XABARLARNI TINGLASH (guruh va kanallar, real vaqtda)
 # ---------------------------------------------------------------------------
 
 @client.on(events.NewMessage(chats=None))
 async def handle_new_message(event):
-    # Faqat guruh xabarlarini ko'rib chiqamiz (shaxsiy xabarlarni emas)
-    if not event.is_group:
-        return
-
-    # Faqat bot ishga tushgandan KEYINGI xabarlar (Telethon NewMessage eventi
-    # tabiatan faqat yangi kelayotgan xabarlarni ushlaydi, eski tarixni o'qimaydi -
-    # lekin qo'shimcha xavfsizlik uchun vaqtni ham tekshiramiz)
-    if BOT_START_TIME and event.message.date.timestamp() < BOT_START_TIME:
+    # Guruh va kanal xabarlarini ko'rib chiqamiz (shaxsiy xabarlarni emas)
+    if not (event.is_group or event.is_channel):
         return
 
     text = event.message.message or ""
-    if not quick_keyword_check(text):
-        return
 
-    if not await is_construction_job_post(text):
-        return
+    async def get_sender():
+        try:
+            return await event.get_sender()
+        except Exception:
+            return None
 
-    phone = extract_phone(text)
-    sender = await event.get_sender()
-    sender_username = getattr(sender, "username", None)
-
-    await post_to_channel(
-        message_text=text,
-        sender_username=sender_username,
-        sender_phone_contact=None,
-        has_phone=bool(phone),
-    )
+    await process_message_text(text, get_sender, event.chat_id, event.message.id)
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +385,13 @@ async def handle_new_message(event):
 
 async def main():
     global BOT_START_TIME
+    load_posted_ids()
     await client.start()
     BOT_START_TIME = datetime.now().timestamp()
-    log.info("Bot ishga tushdi. Faqat shu vaqtdan keyingi xabarlar tahlil qilinadi.")
+    log.info("Bot ishga tushdi.")
+
+    # Avval kecha va bugungi xabarlarni bir marta skanerlaymiz
+    await scan_recent_messages()
 
     # Guruhlarni qidirib, qo'shilishni fon vazifasi sifatida ishga tushiramiz
     asyncio.create_task(discover_and_join_groups())
