@@ -82,8 +82,8 @@ HISTORY_SCAN_DAYS_BACK = 1
 # Xavfsizlik uchun har bir chatda tekshiriladigan maksimal xabarlar soni
 # (juda faol guruhda cheksiz aylanib qolmaslik uchun)
 MAX_MESSAGES_SAFETY_CAP = 500
-# Tarixiy xabarlarni tekshirish orasida biroz kutish - flood-limitdan qochish uchun
-HISTORY_SCAN_DELAY_SECONDS = 1
+# Tarixiy xabarlarni tekshirish orasida biroz kutish (faqat AI chaqiriladigan xabarlar uchun)
+HISTORY_SCAN_DELAY_SECONDS = 0.3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ustalar_bot")
@@ -327,6 +327,11 @@ async def scan_recent_messages():
 
                 total_checked += 1
 
+                # Tez kalit-so'z filtridan o'tmagan xabarlar uchun kutish shart emas -
+                # faqat AI ga yuboriladigan (kalit so'zga mos) xabarlar uchun ozgina kutamiz
+                if not quick_keyword_check(message.message):
+                    continue
+
                 async def get_sender(msg=message):
                     try:
                         return await msg.get_sender()
@@ -404,4 +409,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-   
+       
